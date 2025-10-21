@@ -12,6 +12,13 @@ from pathlib import Path
 from blessed import Terminal
 from lerobot.robots.so101_follower.so101_follower import SO101FollowerConfig, SO101Follower
 
+# Rerun imports (optional)
+try:
+    import rerun as rr
+    RERUN_AVAILABLE = True
+except ImportError:
+    RERUN_AVAILABLE = False
+
 # Configuration
 ROBOT_PORT = "/dev/ttyACM0"
 ROBOT_ID = "blue_follower"
@@ -48,9 +55,40 @@ def setup_logging(verbose=False):
 
 
 class BlessedKeyboardControl:
-    def __init__(self, logger, calibration_dir=None):
+    def __init__(self, logger, calibration_dir=None, use_rerun=False, rerun_addr=None):
         self.term = Terminal()
         self.logger = logger
+        self.use_rerun = use_rerun and RERUN_AVAILABLE
+
+        # Initialize Rerun if requested
+        if self.use_rerun:
+            if rerun_addr is None:
+                rerun_addr = "127.0.0.1:9876"
+
+            # Parse host:port if needed
+            if ':' in rerun_addr:
+                host, port = rerun_addr.split(':')
+            else:
+                host = rerun_addr
+                port = "9876"
+
+            # Build the proper Rerun connection URL
+            rerun_url = f"rerun+http://{host}:{port}/proxy"
+
+            self.logger.info("Initializing Rerun visualization...")
+            self.logger.info(f"Connecting to Rerun at: {rerun_url}")
+
+            try:
+                rr.init("SO101_Keyboard_Control", spawn=False)
+                rr.connect_grpc(rerun_url)
+                self.logger.info(f"Rerun connected successfully to {rerun_url}")
+
+            except Exception as e:
+                self.logger.error(f"Failed to connect to Rerun: {e}", exc_info=True)
+                self.use_rerun = False
+
+        elif use_rerun and not RERUN_AVAILABLE:
+            self.logger.warning("Rerun requested but not available. Install with: pip install rerun-sdk")
 
         # Initialize robot
         print("Connecting to robot...")
@@ -190,6 +228,11 @@ class BlessedKeyboardControl:
         try:
             result = self.robot.send_action(action)
             self.logger.debug(f"Action result: {result}")
+
+            # Log to Rerun
+            if self.use_rerun:
+                self.log_to_rerun()
+
         except Exception as e:
             self.logger.error(f"Failed to send action: {e}", exc_info=True)
             raise
@@ -203,9 +246,50 @@ class BlessedKeyboardControl:
             self.current_positions = {name: obs[f"{name}.pos"] for name in JOINT_NAMES}
             self.logger.info(f"Updated positions: {self.current_positions}")
             self.add_command("Read position from robot")
+
+            # Log to Rerun after reading
+            if self.use_rerun:
+                self.log_to_rerun()
         except Exception as e:
             self.logger.error(f"Failed to read position: {e}", exc_info=True)
             self.add_command(f"Error reading position: {e}")
+
+    def log_to_rerun(self):
+        """Log current state to Rerun."""
+        if not self.use_rerun:
+            return
+
+        try:
+            # Set time for this frame
+            current_time = time.time()
+            rr.set_time_seconds("timestamp", current_time)
+
+            self.logger.debug(f"Logging to Rerun at time {current_time}")
+            self.logger.debug(f"Current positions: {self.current_positions}")
+
+            # Log each joint position as a scalar
+            for name in JOINT_NAMES:
+                pos = self.current_positions[name]
+                self.logger.debug(f"  Logging {name} = {pos}")
+                rr.log(f"robot/joints/{name}", rr.Scalars(pos))
+
+            # Log all positions together for easier viewing
+            all_positions = [self.current_positions[name] for name in JOINT_NAMES]
+            rr.log("robot/all_joints", rr.BarChart(all_positions))
+
+            # Log selected joint indicator
+            selected_idx = self.selected_joint
+            rr.log("control/selected_joint_index", rr.Scalars(selected_idx))
+            rr.log("control/selected_joint_name", rr.TextLog(JOINT_NAMES[self.selected_joint]))
+
+            # Log last command
+            if self.last_command:
+                rr.log("control/last_command", rr.TextLog(self.last_command))
+
+            self.logger.debug("Rerun logging completed successfully")
+
+        except Exception as e:
+            self.logger.error(f"Failed to log to Rerun: {e}", exc_info=True)
 
     def home_position(self):
         """Move all joints to zero position."""
@@ -224,6 +308,10 @@ class BlessedKeyboardControl:
             with t.fullscreen(), t.cbreak():
                 self.logger.debug("Entered fullscreen mode")
 
+                # Log initial state to Rerun
+                if self.use_rerun:
+                    self.log_to_rerun()
+
                 while self.running:
                     # Draw UI
                     self.draw_ui()
@@ -232,6 +320,13 @@ class BlessedKeyboardControl:
                     key = t.inkey(timeout=0.05)  # Reduced timeout for more responsive UI
 
                     if not key:
+                        # Even when no key is pressed, periodically log to Rerun
+                        # This helps keep the visualization alive
+                        if self.use_rerun:
+                            # Only log every ~200ms to avoid spam
+                            import random
+                            if random.random() < 0.2:  # 20% chance = ~200ms on average
+                                self.log_to_rerun()
                         continue
 
                     self.logger.debug(f"Key pressed: {repr(key)} (name={key.name if hasattr(key, 'name') else None})")
@@ -305,11 +400,32 @@ class BlessedKeyboardControl:
 
 if __name__ == "__main__":
     # Parse arguments
-    parser = argparse.ArgumentParser(description="SO101 Follower Keyboard Control with Blessed UI")
+    parser = argparse.ArgumentParser(
+        description="SO101 Follower Keyboard Control with Blessed UI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage (no visualization)
+  python test_keyboard_control_blessed.py
+
+  # With Rerun visualization (WSL to Windows)
+  # First, on Windows run: rerun --connect ws://0.0.0.0:9876
+  # Then get WSL host IP: ip route show | grep -i default | awk '{print $3}'
+  # Finally on WSL:
+  python test_keyboard_control_blessed.py --rerun --rerun-addr <WINDOWS_IP>:9876
+
+  # If WSL2 with mirrored networking (Windows 11 22H2+):
+  python test_keyboard_control_blessed.py --rerun --rerun-addr 127.0.0.1:9876
+        """
+    )
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose debug logging')
     parser.add_argument('--port', default=ROBOT_PORT, help=f'Robot port (default: {ROBOT_PORT})')
     parser.add_argument('--id', default=ROBOT_ID, help=f'Robot ID (default: {ROBOT_ID})')
     parser.add_argument('--calibration-dir', default=None, help='Calibration directory path')
+    parser.add_argument('--rerun', action='store_true', help='Enable Rerun visualization')
+    parser.add_argument('--rerun-addr', default=None,
+                        help='Rerun server address (default: 127.0.0.1:9876). '
+                             'For WSL->Windows, use Windows host IP from: ip route show | grep default | awk \'{print $3}\'')
     args = parser.parse_args()
 
     # Update configuration from args
@@ -320,9 +436,17 @@ if __name__ == "__main__":
     logger = setup_logging(verbose=args.verbose)
     logger.info(f"Starting SO101 control - Port: {ROBOT_PORT}, ID: {ROBOT_ID}")
     logger.info(f"Verbose mode: {args.verbose}")
+    logger.info(f"Rerun visualization: {args.rerun}")
+    if args.rerun and args.rerun_addr:
+        logger.info(f"Rerun address: {args.rerun_addr}")
 
     try:
-        controller = BlessedKeyboardControl(logger, calibration_dir=args.calibration_dir)
+        controller = BlessedKeyboardControl(
+            logger,
+            calibration_dir=args.calibration_dir,
+            use_rerun=args.rerun,
+            rerun_addr=args.rerun_addr
+        )
         controller.run()
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
