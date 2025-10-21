@@ -19,6 +19,13 @@ try:
 except ImportError:
     RERUN_AVAILABLE = False
 
+# URDF parsing (optional)
+try:
+    from urdf_parser_py import urdf as urdf_parser
+    URDF_AVAILABLE = True
+except ImportError:
+    URDF_AVAILABLE = False
+
 # Configuration
 ROBOT_PORT = "/dev/ttyACM0"
 ROBOT_ID = "blue_follower"
@@ -55,10 +62,12 @@ def setup_logging(verbose=False):
 
 
 class BlessedKeyboardControl:
-    def __init__(self, logger, calibration_dir=None, use_rerun=False, rerun_addr=None):
+    def __init__(self, logger, calibration_dir=None, use_rerun=False, rerun_addr=None, urdf_path=None):
         self.term = Terminal()
         self.logger = logger
         self.use_rerun = use_rerun and RERUN_AVAILABLE
+        self.urdf_path = urdf_path
+        self.urdf_robot = None
 
         # Initialize Rerun if requested
         if self.use_rerun:
@@ -82,6 +91,19 @@ class BlessedKeyboardControl:
                 rr.init("SO101_Keyboard_Control", spawn=False)
                 rr.connect_grpc(rerun_url)
                 self.logger.info(f"Rerun connected successfully to {rerun_url}")
+
+                # Load URDF if provided
+                if self.urdf_path and URDF_AVAILABLE:
+                    self.logger.info(f"Loading URDF from: {self.urdf_path}")
+                    try:
+                        self.urdf_robot = urdf_parser.URDF.from_xml_file(self.urdf_path)
+                        self.logger.info(f"URDF loaded: {self.urdf_robot.name}")
+                        self.log_urdf_to_rerun()
+                    except Exception as e:
+                        self.logger.error(f"Failed to load URDF: {e}", exc_info=True)
+                        self.urdf_robot = None
+                elif self.urdf_path and not URDF_AVAILABLE:
+                    self.logger.warning("URDF path provided but urdf-parser-py not installed. Install with: pip install urdf-parser-py")
 
             except Exception as e:
                 self.logger.error(f"Failed to connect to Rerun: {e}", exc_info=True)
@@ -254,6 +276,94 @@ class BlessedKeyboardControl:
             self.logger.error(f"Failed to read position: {e}", exc_info=True)
             self.add_command(f"Error reading position: {e}")
 
+    def log_urdf_to_rerun(self):
+        """Log URDF static structure to Rerun using Rerun's built-in URDF loader."""
+        if not self.use_rerun or not self.urdf_path:
+            return
+
+        try:
+            self.logger.info("Logging URDF structure to Rerun...")
+
+            # Use Rerun's built-in file loader for URDF
+            # This automatically loads the URDF and all associated meshes
+            urdf_path_abs = Path(self.urdf_path).resolve()
+            self.logger.info(f"Loading URDF file: {urdf_path_abs}")
+
+            # Log the URDF file - Rerun will parse it and load meshes
+            rr.log_file_from_path(str(urdf_path_abs), entity_path_prefix="world/robot")
+            self.logger.info("URDF logged to Rerun successfully")
+
+        except AttributeError as e:
+            self.logger.warning(f"log_file_from_path not available in this Rerun version: {e}")
+            self.logger.warning("Try: pip install --upgrade rerun-sdk")
+        except Exception as e:
+            self.logger.error(f"Failed to log URDF to Rerun: {e}", exc_info=True)
+
+    def update_robot_pose_in_rerun(self):
+        """Update robot joint transforms in Rerun based on current joint positions."""
+        if not self.use_rerun:
+            return
+
+        try:
+            import numpy as np
+
+            # Joint angles in radians (convert from degrees)
+            joint_angles = {}
+            for name in JOINT_NAMES:
+                # Convert degrees to radians
+                angle_deg = self.current_positions[name]
+                angle_rad = np.radians(angle_deg)
+                joint_angles[name] = angle_rad
+
+            # When Rerun loads a URDF, it creates the hierarchy as:
+            # world/robot/so101_new_calib/base_link/shoulder_pan/shoulder_link/shoulder_lift/...
+            # Each joint is a child of its parent link
+
+            robot_prefix = "world/robot/so101_new_calib/base_link"
+
+            # Log transforms for each joint at their correct hierarchical location
+            # Joint hierarchy from URDF:
+            # base_link -> shoulder_pan -> shoulder_link -> shoulder_lift -> upper_arm_link -> ...
+
+            # Shoulder pan joint (child of base_link, rotates around Z)
+            rr.log(
+                f"{robot_prefix}/shoulder_pan",
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 0, 1], angle=joint_angles["shoulder_pan"]))
+            )
+
+            # Shoulder lift joint (child of shoulder_link, rotates around Y)
+            rr.log(
+                f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift",
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["shoulder_lift"]))
+            )
+
+            # Elbow flex joint (child of upper_arm_link, rotates around Y)
+            rr.log(
+                f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift/upper_arm_link/elbow_flex",
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["elbow_flex"]))
+            )
+
+            # Wrist flex joint (child of lower_arm_link, rotates around Y)
+            rr.log(
+                f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift/upper_arm_link/elbow_flex/lower_arm_link/wrist_flex",
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["wrist_flex"]))
+            )
+
+            # Wrist roll joint (child of wrist_link, rotates around X)
+            rr.log(
+                f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift/upper_arm_link/elbow_flex/lower_arm_link/wrist_flex/wrist_link/wrist_roll",
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[1, 0, 0], angle=joint_angles["wrist_roll"]))
+            )
+
+            # Gripper joint (child of gripper_link, rotates around Y)
+            rr.log(
+                f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift/upper_arm_link/elbow_flex/lower_arm_link/wrist_flex/wrist_link/wrist_roll/gripper_link/gripper",
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["gripper"]))
+            )
+
+        except Exception as e:
+            self.logger.error(f"Failed to update robot pose: {e}", exc_info=True)
+
     def log_to_rerun(self):
         """Log current state to Rerun."""
         if not self.use_rerun:
@@ -285,6 +395,10 @@ class BlessedKeyboardControl:
             # Log last command
             if self.last_command:
                 rr.log("control/last_command", rr.TextLog(self.last_command))
+
+            # Update robot 3D pose if URDF path is provided
+            if self.urdf_path:
+                self.update_robot_pose_in_rerun()
 
             self.logger.debug("Rerun logging completed successfully")
 
@@ -426,6 +540,8 @@ Examples:
     parser.add_argument('--rerun-addr', default=None,
                         help='Rerun server address (default: 127.0.0.1:9876). '
                              'For WSL->Windows, use Windows host IP from: ip route show | grep default | awk \'{print $3}\'')
+    parser.add_argument('--urdf', default=None,
+                        help='Path to URDF file for 3D visualization (e.g., dep/SO-ARM100/Simulation/SO101/so101_new_calib.urdf)')
     args = parser.parse_args()
 
     # Update configuration from args
@@ -445,7 +561,8 @@ Examples:
             logger,
             calibration_dir=args.calibration_dir,
             use_rerun=args.rerun,
-            rerun_addr=args.rerun_addr
+            rerun_addr=args.rerun_addr,
+            urdf_path=args.urdf
         )
         controller.run()
     except Exception as e:
