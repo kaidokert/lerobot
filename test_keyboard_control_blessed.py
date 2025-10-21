@@ -27,7 +27,7 @@ except ImportError:
     URDF_AVAILABLE = False
 
 # Configuration
-ROBOT_PORT = "/dev/ttyACM0"
+ROBOT_PORT = "/dev/ttyACM1"
 ROBOT_ID = "blue_follower"
 STEP_SIZE = 1.0  # How much to move per key press (in degrees)
 LARGE_STEP_SIZE = 5.0  # Larger step with Shift
@@ -325,40 +325,44 @@ class BlessedKeyboardControl:
             # Joint hierarchy from URDF:
             # base_link -> shoulder_pan -> shoulder_link -> shoulder_lift -> upper_arm_link -> ...
 
-            # Shoulder pan joint (child of base_link, rotates around Z)
+            # NOTE: All joints in the URDF have axis="0 0 1" (Z-axis in their local frame)
+            # The actual rotation directions come from the origin transforms in the URDF
+            # We need to experiment to match real robot behavior
+
+            # Shoulder pan: URDF says Z-axis, but inverted direction
             rr.log(
                 f"{robot_prefix}/shoulder_pan",
-                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 0, 1], angle=joint_angles["shoulder_pan"]))
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 0, -1], angle=joint_angles["shoulder_pan"]))
             )
 
-            # Shoulder lift joint (child of shoulder_link, rotates around Y)
+            # Shoulder lift: Y-axis - this was already correct before!
             rr.log(
                 f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift",
                 rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["shoulder_lift"]))
             )
 
-            # Elbow flex joint (child of upper_arm_link, rotates around Y)
+            # Elbow flex: URDF says Z-axis, needs testing for correct axis
             rr.log(
                 f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift/upper_arm_link/elbow_flex",
-                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["elbow_flex"]))
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 0, 1], angle=joint_angles["elbow_flex"]))
             )
 
-            # Wrist flex joint (child of lower_arm_link, rotates around Y)
+            # Wrist flex: URDF says Z-axis, needs testing
             rr.log(
                 f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift/upper_arm_link/elbow_flex/lower_arm_link/wrist_flex",
-                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["wrist_flex"]))
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 0, 1], angle=joint_angles["wrist_flex"]))
             )
 
-            # Wrist roll joint (child of wrist_link, rotates around X)
+            # Wrist roll: Y-axis
             rr.log(
                 f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift/upper_arm_link/elbow_flex/lower_arm_link/wrist_flex/wrist_link/wrist_roll",
-                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[1, 0, 0], angle=joint_angles["wrist_roll"]))
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["wrist_roll"]))
             )
 
-            # Gripper joint (child of gripper_link, rotates around Y)
+            # Gripper: Y-axis with inverted sign (axis was correct, just needed sign flip)
             rr.log(
                 f"{robot_prefix}/shoulder_pan/shoulder_link/shoulder_lift/upper_arm_link/elbow_flex/lower_arm_link/wrist_flex/wrist_link/wrist_roll/gripper_link/gripper",
-                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=joint_angles["gripper"]))
+                rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[0, -1, 0], angle=joint_angles["gripper"]))
             )
 
         except Exception as e:

@@ -744,7 +744,11 @@ class MotorsBus(abc.ABC):
 
         user_pressed_enter = False
         while not user_pressed_enter:
-            positions = self.sync_read("Present_Position", motors, normalize=False)
+            try:
+                positions = self.sync_read("Present_Position", motors, normalize=False)
+            except ConnectionError:
+                print("\nConnection error while reading motor positions. Retrying...")
+                continue
             mins = {motor: min(positions[motor], min_) for motor, min_ in mins.items()}
             maxes = {motor: max(positions[motor], max_) for motor, max_ in maxes.items()}
 
