@@ -92,7 +92,7 @@ def setup_logging(verbose=False):
 
 
 class BlessedKeyboardControl:
-    def __init__(self, logger, calibration_dir=None, use_rerun=False, rerun_addr=None, urdf_path=None, enable_ik=False):
+    def __init__(self, logger, calibration_dir=None, use_rerun=False, rerun_addr=None, urdf_path=None, enable_ik=False, no_robot=False):
         self.term = Terminal()
         self.logger = logger
         self.use_rerun = use_rerun and RERUN_AVAILABLE
@@ -102,6 +102,8 @@ class BlessedKeyboardControl:
         self.kinematics = None
         self.control_mode = "joint"  # "joint" or "cartesian"
         self.cartesian_step = 0.01  # 1cm steps in Cartesian mode
+        self.no_robot = no_robot
+        self.robot = None
 
         # Initialize Rerun if requested
         if self.use_rerun:
@@ -127,17 +129,19 @@ class BlessedKeyboardControl:
                 self.logger.info(f"Rerun connected successfully to {rerun_url}")
 
                 # Load URDF if provided
-                if self.urdf_path and URDF_AVAILABLE:
+                if self.urdf_path:
                     self.logger.info(f"Loading URDF from: {self.urdf_path}")
-                    try:
-                        self.urdf_robot = urdf_parser.URDF.from_xml_file(self.urdf_path)
-                        self.logger.info(f"URDF loaded: {self.urdf_robot.name}")
-                        self.log_urdf_to_rerun()
-                    except Exception as e:
-                        self.logger.error(f"Failed to load URDF: {e}", exc_info=True)
-                        self.urdf_robot = None
-                elif self.urdf_path and not URDF_AVAILABLE:
-                    self.logger.warning("URDF path provided but urdf-parser-py not installed. Install with: pip install urdf-parser-py")
+                    # Always try to log URDF to Rerun (uses Rerun's built-in loader)
+                    self.log_urdf_to_rerun()
+
+                    # Optionally also parse with urdf-parser-py if available (for additional analysis)
+                    if URDF_AVAILABLE:
+                        try:
+                            self.urdf_robot = urdf_parser.URDF.from_xml_file(self.urdf_path)
+                            self.logger.info(f"URDF also parsed with urdf-parser-py: {self.urdf_robot.name}")
+                        except Exception as e:
+                            self.logger.error(f"Failed to parse URDF with urdf-parser-py: {e}", exc_info=True)
+                            self.urdf_robot = None
 
             except Exception as e:
                 self.logger.error(f"Failed to connect to Rerun: {e}", exc_info=True)
@@ -146,47 +150,54 @@ class BlessedKeyboardControl:
         elif use_rerun and not RERUN_AVAILABLE:
             self.logger.warning("Rerun requested but not available. Install with: pip install rerun-sdk")
 
-        # Initialize robot
-        print("Connecting to robot...")
-        self.logger.info(f"Connecting to robot on {ROBOT_PORT} with id {ROBOT_ID}")
+        # Initialize robot (if not in no-robot mode)
+        if not self.no_robot:
+            print("Connecting to robot...")
+            self.logger.info(f"Connecting to robot on {ROBOT_PORT} with id {ROBOT_ID}")
 
-        # Set calibration directory - let the robot use its default path
-        # The robot will automatically append /robots/so101_follower/ to the base path
-        if calibration_dir is not None:
-            calibration_dir = Path(calibration_dir)
-            self.logger.info(f"Using custom calibration directory: {calibration_dir}")
+            # Set calibration directory - let the robot use its default path
+            # The robot will automatically append /robots/so101_follower/ to the base path
+            if calibration_dir is not None:
+                calibration_dir = Path(calibration_dir)
+                self.logger.info(f"Using custom calibration directory: {calibration_dir}")
+            else:
+                self.logger.info("Using default calibration directory")
+
+            config = SO101FollowerConfig(
+                port=ROBOT_PORT,
+                id=ROBOT_ID,
+                calibration_dir=calibration_dir  # Will be None if not specified, so robot uses default
+            )
+
+            self.robot = SO101Follower(config)
+
+            # Log calibration info BEFORE connecting
+            if hasattr(self.robot, 'calibration_fpath'):
+                self.logger.info(f"Calibration file path: {self.robot.calibration_fpath}")
+
+            self.robot.connect()
+            self.logger.info("Robot connected successfully")
+
+            # Log calibration details AFTER connecting
+            if hasattr(self.robot, 'calibration') and self.robot.calibration:
+                self.logger.info("Calibration loaded successfully:")
+                for motor, calib in self.robot.calibration.items():
+                    self.logger.info(f"  {motor}: range=[{calib.range_min}, {calib.range_max}], offset={calib.homing_offset}")
+            else:
+                self.logger.warning("WARNING: No calibration loaded! Robot will use raw values.")
+
+            # Get initial position
+            self.logger.info("Reading initial position from robot...")
+            obs = self.robot.get_observation()
+            self.logger.debug(f"Initial observation: {obs}")
+            self.current_positions = {name: obs[f"{name}.pos"] for name in JOINT_NAMES}
+            self.logger.info(f"Initial positions: {self.current_positions}")
         else:
-            self.logger.info("Using default calibration directory")
-
-        config = SO101FollowerConfig(
-            port=ROBOT_PORT,
-            id=ROBOT_ID,
-            calibration_dir=calibration_dir  # Will be None if not specified, so robot uses default
-        )
-
-        self.robot = SO101Follower(config)
-
-        # Log calibration info BEFORE connecting
-        if hasattr(self.robot, 'calibration_fpath'):
-            self.logger.info(f"Calibration file path: {self.robot.calibration_fpath}")
-
-        self.robot.connect()
-        self.logger.info("Robot connected successfully")
-
-        # Log calibration details AFTER connecting
-        if hasattr(self.robot, 'calibration') and self.robot.calibration:
-            self.logger.info("Calibration loaded successfully:")
-            for motor, calib in self.robot.calibration.items():
-                self.logger.info(f"  {motor}: range=[{calib.range_min}, {calib.range_max}], offset={calib.homing_offset}")
-        else:
-            self.logger.warning("WARNING: No calibration loaded! Robot will use raw values.")
-
-        # Get initial position
-        self.logger.info("Reading initial position from robot...")
-        obs = self.robot.get_observation()
-        self.logger.debug(f"Initial observation: {obs}")
-        self.current_positions = {name: obs[f"{name}.pos"] for name in JOINT_NAMES}
-        self.logger.info(f"Initial positions: {self.current_positions}")
+            print("Running in no-robot mode (visualization only)...")
+            self.logger.info("No-robot mode enabled - running without physical robot")
+            # Initialize with zero positions
+            self.current_positions = {name: 0.0 for name in JOINT_NAMES}
+            self.logger.info(f"Initial positions (simulated): {self.current_positions}")
 
         # Initialize kinematics if enabled
         if self.enable_ik:
@@ -244,7 +255,16 @@ class BlessedKeyboardControl:
         # Robot info and control mode
         mode_color = t.green if self.control_mode == "cartesian" else t.cyan
         mode_text = self.control_mode.upper()
-        lines.append(f"  Robot: {t.cyan}{ROBOT_ID}{t.normal} on {t.cyan}{ROBOT_PORT}{t.normal}")
+
+        # Show connection status
+        if self.robot is not None:
+            robot_status = f"{t.green}CONNECTED{t.normal}"
+            robot_info = f"  Robot: {t.cyan}{ROBOT_ID}{t.normal} on {t.cyan}{ROBOT_PORT}{t.normal} [{robot_status}]"
+        else:
+            robot_status = f"{t.yellow}SIMULATION{t.normal}"
+            robot_info = f"  Robot: [{robot_status}] (no hardware connection)"
+
+        lines.append(robot_info)
         lines.append(f"  Mode: {mode_color}{mode_text}{t.normal}" +
                     (f" (IK not available)" if self.control_mode == "cartesian" and not self.kinematics else ""))
         lines.append("")
@@ -336,8 +356,11 @@ class BlessedKeyboardControl:
         action = {f"{name}.pos": self.current_positions[name] for name in JOINT_NAMES}
         self.logger.debug(f"Sending action to robot: {action}")
         try:
-            result = self.robot.send_action(action)
-            self.logger.debug(f"Action result: {result}")
+            if self.robot is not None:
+                result = self.robot.send_action(action)
+                self.logger.debug(f"Action result: {result}")
+            else:
+                self.logger.debug("No robot connected - simulating action")
 
             # Log to Rerun
             if self.use_rerun:
@@ -351,11 +374,15 @@ class BlessedKeyboardControl:
         """Read current position from robot."""
         self.logger.info("Reading position from robot...")
         try:
-            obs = self.robot.get_observation()
-            self.logger.debug(f"Observation received: {obs}")
-            self.current_positions = {name: obs[f"{name}.pos"] for name in JOINT_NAMES}
-            self.logger.info(f"Updated positions: {self.current_positions}")
-            self.add_command("Read position from robot")
+            if self.robot is not None:
+                obs = self.robot.get_observation()
+                self.logger.debug(f"Observation received: {obs}")
+                self.current_positions = {name: obs[f"{name}.pos"] for name in JOINT_NAMES}
+                self.logger.info(f"Updated positions: {self.current_positions}")
+                self.add_command("Read position from robot")
+            else:
+                self.logger.info("No robot connected - keeping current simulated positions")
+                self.add_command("No robot connected (simulation mode)")
 
             # Log to Rerun after reading
             if self.use_rerun:
@@ -732,8 +759,9 @@ class BlessedKeyboardControl:
         finally:
             # Cleanup
             print(t.clear)
-            print("Disconnecting robot...")
-            self.robot.disconnect()
+            if self.robot is not None:
+                print("Disconnecting robot...")
+                self.robot.disconnect()
             print("Done!")
 
 
@@ -780,6 +808,9 @@ Settings are saved automatically when using --save-config.
     parser.add_argument('--enable-ik', action='store_true',
                         default=saved_config.get('enable_ik', False),
                         help='Enable inverse kinematics for Cartesian control (requires placo)')
+    parser.add_argument('--no-robot', action='store_true',
+                        default=saved_config.get('no_robot', False),
+                        help='Run without robot connection (visualization only)')
     parser.add_argument('--save-config', action='store_true',
                         help='Save current settings to config file for future runs')
     args = parser.parse_args()
@@ -798,6 +829,7 @@ Settings are saved automatically when using --save-config.
             'rerun_addr': args.rerun_addr,
             'urdf': args.urdf,
             'enable_ik': args.enable_ik,
+            'no_robot': args.no_robot,
         }
         save_config(new_config)
         print(f"Configuration saved to {CONFIG_FILE}")
@@ -818,7 +850,8 @@ Settings are saved automatically when using --save-config.
             use_rerun=args.rerun,
             rerun_addr=args.rerun_addr,
             urdf_path=args.urdf,
-            enable_ik=args.enable_ik
+            enable_ik=args.enable_ik,
+            no_robot=args.no_robot
         )
         controller.run()
     except Exception as e:
